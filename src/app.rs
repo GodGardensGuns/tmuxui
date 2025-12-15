@@ -41,6 +41,8 @@ pub struct App {
     // Inputs/Misc
     pub input_buffer: String,
     pub should_quit: bool,
+    
+    // The name of the session we want to attach to after quitting
     pub target_attach: Option<String>,
 }
 

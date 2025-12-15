@@ -33,7 +33,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // 1. Sessions
     let sessions: Vec<ListItem> = app.sessions.iter().map(|s| {
         ListItem::new(Line::from(vec![
-            Span::styled(format!("📦 {}", s.name), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{} {}", "::", s.name), Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(format!(" ({}) ", s.count)),
             Span::styled(format!("[{}]", s.created), Style::default().fg(Color::DarkGray)),
         ]))
@@ -45,7 +45,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     // 2. Windows
     let windows: Vec<ListItem> = app.windows.iter().map(|w| {
-        ListItem::new(Line::from(format!("{} {}: {} [{}]", if w.active { "🟢" } else { "⚪" }, w.id, w.name, w.layout)))
+        // Using a safe simple indicator instead of complex unicode for broad compatibility
+        let active_indicator = if w.active { "*" } else { " " };
+        ListItem::new(Line::from(format!("{} {}: {} [{}]", active_indicator, w.id, w.name, w.layout)))
     }).collect();
     f.render_stateful_widget(
         List::new(windows).block(Block::default().borders(Borders::ALL).title(" Windows ").border_style(get_border(FocusArea::Windows))).highlight_style(highlight_style),
@@ -54,8 +56,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     // 3. Panes
     let panes: Vec<ListItem> = app.panes.iter().map(|p| {
+        let active_indicator = if p.active { "*" } else { " " };
         let content = vec![
-            Line::from(format!("{} ID: {}", if p.active { "🔹" } else { "🔸" }, p.id)),
+            Line::from(format!("{} ID: {}", active_indicator, p.id)),
             Line::from(format!("   Cmd: {}", p.current_command)).style(Style::default().fg(Color::Magenta)),
             Line::from(format!("   Path: {}", p.current_path)).style(Style::default().fg(Color::DarkGray)),
             Line::from(format!("   Size: {}x{}", p.width, p.height)).style(Style::default().fg(Color::DarkGray)),
@@ -88,11 +91,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 fn get_footer_text(app: &App) -> String {
     match app.state {
         AppState::Normal => {
+            // Common navigation keys
             let common = "NAV: Arrows/Tab | q: Quit | r: Refresh";
             match app.focus {
                 FocusArea::Sessions => format!("{} | Enter: Attach | n: New | d: Del | R: Rename", common),
-                FocusArea::Windows => format!("{} | n: New Win | d: Del Win | R: Rename", common),
-                FocusArea::Panes => format!("{} | n: Split Pane | d: Kill Pane", common),
+                FocusArea::Windows => format!("{} | Enter: Attach | n: New Win | d: Del Win | R: Rename", common),
+                FocusArea::Panes => format!("{} | Enter: Attach | n: Split Pane | d: Kill Pane", common),
             }
         },
         AppState::InputNewSession | AppState::InputRenameSession | 

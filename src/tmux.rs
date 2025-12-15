@@ -1,19 +1,29 @@
 use std::process::Command;
 use crate::models::{Session, Window, Pane};
 
+/// Executes a tmux command with the given arguments.
+/// Returns the stdout as a trimmed String if successful, or None if it fails.
 pub fn run_tmux(args: &[&str]) -> Option<String> {
+    // We rely on 'tmux' being in the system PATH, which is standard on Linux/macOS.
     let output = Command::new("tmux").args(args).output().ok()?;
-    if !output.status.success() { return None; }
+    
+    if !output.status.success() { 
+        return None; 
+    }
+    
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-// --- READ ---
+// --- READ OPERATIONS ---
 
+/// Fetches all active sessions.
+/// Uses a custom format string to parse output reliably.
 pub fn get_sessions() -> Vec<Session> {
     let raw = match run_tmux(&["list-sessions", "-F", "#{session_id}|#{session_name}|#{session_windows}|#{session_created_string}"]) {
         Some(s) => s,
         None => return Vec::new(),
     };
+    
     raw.lines().filter(|l| !l.is_empty()).map(|line| {
         let parts: Vec<&str> = line.split('|').collect();
         Session {
@@ -25,11 +35,13 @@ pub fn get_sessions() -> Vec<Session> {
     }).collect()
 }
 
+/// Fetches windows for a specific session ID.
 pub fn get_windows(session_id: &str) -> Vec<Window> {
     let raw = match run_tmux(&["list-windows", "-t", session_id, "-F", "#{window_id}|#{window_name}|#{window_active}|#{window_layout}"]) {
         Some(s) => s,
         None => return Vec::new(),
     };
+
     raw.lines().filter(|l| !l.is_empty()).map(|line| {
         let parts: Vec<&str> = line.split('|').collect();
         Window {
@@ -41,11 +53,13 @@ pub fn get_windows(session_id: &str) -> Vec<Window> {
     }).collect()
 }
 
+/// Fetches panes for a specific window ID.
 pub fn get_panes(window_id: &str) -> Vec<Pane> {
     let raw = match run_tmux(&["list-panes", "-t", window_id, "-F", "#{pane_id}|#{pane_width}|#{pane_height}|#{pane_current_path}|#{pane_current_command}|#{pane_active}"]) {
         Some(s) => s,
         None => return Vec::new(),
     };
+
     raw.lines().filter(|l| !l.is_empty()).map(|line| {
         let parts: Vec<&str> = line.split('|').collect();
         Pane {
@@ -59,7 +73,7 @@ pub fn get_panes(window_id: &str) -> Vec<Pane> {
     }).collect()
 }
 
-// --- WRITE ---
+// --- WRITE OPERATIONS ---
 
 pub fn create_session(name: &str) {
     run_tmux(&["new-session", "-d", "-s", name]);
@@ -85,11 +99,22 @@ pub fn kill_window(window_id: &str) {
     run_tmux(&["kill-window", "-t", window_id]);
 }
 
+/// Sets the active window for a session. 
+/// Used to ensure the user lands on the correct window when attaching.
+pub fn select_window(window_id: &str) {
+    run_tmux(&["select-window", "-t", window_id]);
+}
+
 pub fn create_pane(window_id: &str) {
-    // Default split (usually vertical or based on layout)
     run_tmux(&["split-window", "-t", window_id]);
 }
 
 pub fn kill_pane(pane_id: &str) {
     run_tmux(&["kill-pane", "-t", pane_id]);
+}
+
+/// Sets the active pane for a window.
+/// Used to ensure the cursor is in the correct pane when attaching.
+pub fn select_pane(pane_id: &str) {
+    run_tmux(&["select-pane", "-t", pane_id]);
 }
