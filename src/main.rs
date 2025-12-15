@@ -73,14 +73,12 @@ fn run_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()>
                                     app.input_buffer.clear();
                                 },
                                 FocusArea::Windows => {
-                                    // Check existence without holding borrow
                                     if app.get_selected_session().is_some() {
                                         app.state = AppState::InputNewWindow;
                                         app.input_buffer.clear();
                                     }
                                 },
                                 FocusArea::Panes => {
-                                    // FIX: Clone ID first, then mutate app
                                     let win_id = app.get_selected_window().map(|w| w.id.clone());
                                     if let Some(id) = win_id {
                                         tmux::create_pane(&id);
@@ -92,7 +90,6 @@ fn run_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()>
                             // Context Actions: Rename (R - Shift+r)
                             KeyCode::Char('R') => match app.focus {
                                 FocusArea::Sessions => {
-                                    // FIX: Clone name first, drop borrow, then mutate state
                                     let current_name = app.get_selected_session().map(|s| s.name.clone());
                                     if let Some(name) = current_name {
                                         app.state = AppState::InputRenameSession;
@@ -100,7 +97,6 @@ fn run_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()>
                                     }
                                 },
                                 FocusArea::Windows => {
-                                    // FIX: Clone name first
                                     let current_name = app.get_selected_window().map(|w| w.name.clone());
                                     if let Some(name) = current_name {
                                         app.state = AppState::InputRenameWindow;
@@ -131,13 +127,26 @@ fn run_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()>
 
                             // Attach (Enter)
                             KeyCode::Enter => {
-                                if app.focus == FocusArea::Sessions {
-                                    // FIX: Clone name first
-                                    let target_name = app.get_selected_session().map(|s| s.name.clone());
-                                    if let Some(name) = target_name {
-                                        app.target_attach = Some(name);
-                                        app.should_quit = true;
-                                    }
+                                match app.focus {
+                                    FocusArea::Sessions => {
+                                        // Attach to Session
+                                        let target = app.get_selected_session().map(|s| s.name.clone());
+                                        if let Some(t) = target {
+                                            app.target_attach = Some(t);
+                                            app.should_quit = true;
+                                        }
+                                    },
+                                    FocusArea::Windows => {
+                                        // Attach to specific Window (Format: "session:window_id")
+                                        let sess_name = app.get_selected_session().map(|s| s.name.clone());
+                                        let win_id = app.get_selected_window().map(|w| w.id.clone());
+                                        
+                                        if let (Some(s), Some(w)) = (sess_name, win_id) {
+                                            app.target_attach = Some(format!("{}:{}", s, w));
+                                            app.should_quit = true;
+                                        }
+                                    },
+                                    _ => {}
                                 }
                             }
                             _ => {}
@@ -184,12 +193,11 @@ fn run_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()>
 
 fn handle_input_submission(app: &mut App) {
     if app.input_buffer.trim().is_empty() { return; }
-    let val = app.input_buffer.trim().to_string(); // Clone string to own it
+    let val = app.input_buffer.trim().to_string();
 
     match app.state {
         AppState::InputNewSession => tmux::create_session(&val),
         AppState::InputRenameSession => {
-            // FIX: Clone the old name so we don't borrow app while calling tmux
             let old_name = app.get_selected_session().map(|s| s.name.clone());
             if let Some(old) = old_name {
                 tmux::rename_session(&old, &val);
