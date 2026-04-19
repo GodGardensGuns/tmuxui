@@ -199,6 +199,8 @@ fn is_no_server_error(message: &str) -> bool {
     normalized.contains("no server running")
         || normalized.contains("failed to connect to server")
         || normalized.contains("connection refused")
+        || (normalized.contains("error connecting to")
+            && normalized.contains("no such file or directory"))
 }
 
 #[cfg(test)]
@@ -263,6 +265,9 @@ mod tests {
             "no server running on /tmp/tmux-501/default"
         ));
         assert!(is_no_server_error("failed to connect to server"));
+        assert!(is_no_server_error(
+            "error connecting to /tmp/tmux-501/default (No such file or directory)"
+        ));
         assert!(!is_no_server_error("permission denied"));
     }
 }
