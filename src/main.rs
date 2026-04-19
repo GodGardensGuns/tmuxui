@@ -4,11 +4,9 @@ mod tmux;
 mod ui;
 
 use anyhow::{bail, Context, Result};
-use app::{App, AppState, FocusArea};
+use app::{App, ConfirmIntent, FocusArea, InputIntent, ModalState};
 use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    },
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -37,7 +35,7 @@ impl TerminalSession {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = std::io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(stdout, EnterAlternateScreen)?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
 
@@ -52,11 +50,7 @@ impl TerminalSession {
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(
-            self.terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        );
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         let _ = self.terminal.show_cursor();
     }
 }
@@ -68,17 +62,18 @@ fn run_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()>
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    match app.state {
-                        AppState::Normal => handle_normal_mode(app, key.code, key.modifiers),
-                        AppState::InputNewSession
-                        | AppState::InputRenameSession
-                        | AppState::InputNewWindow
-                        | AppState::InputRenameWindow => {
-                            handle_input_mode(app, key.code, key.modifiers)
+                    if app.help.visible {
+                        handle_help_mode(app, key.code, key.modifiers);
+                    } else if app.filter.active {
+                        handle_filter_mode(app, key.code, key.modifiers);
+                    } else {
+                        match app.modal {
+                            ModalState::Input(_) => handle_input_mode(app, key.code, key.modifiers),
+                            ModalState::Confirm(_) => {
+                                handle_confirm_mode(app, key.code, key.modifiers)
+                            }
+                            ModalState::None => handle_normal_mode(app, key.code, key.modifiers),
                         }
-                        AppState::ConfirmDeleteSession
-                        | AppState::ConfirmDeleteWindow
-                        | AppState::ConfirmDeletePane => handle_confirm_mode(app, key.code),
                     }
                 }
             }
@@ -90,14 +85,24 @@ fn run_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()>
     }
 }
 
+fn handle_help_mode(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+    match code {
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => app.should_quit = true,
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => app.help.visible = false,
+        _ => {}
+    }
+}
+
 fn handle_normal_mode(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     match code {
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => app.should_quit = true,
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Char('?') => app.help.visible = true,
+        KeyCode::Char('/') => app.open_filter(),
         KeyCode::Char('r') => {
             app.refresh_all();
-            if !app.status.is_error() {
-                app.set_info("Refreshed tmux data.");
+            if app.connection == tmux::TmuxConnectionState::Connected {
+                app.set_info_banner("Refreshed", "tmux data is up to date.");
             }
         }
         KeyCode::Down | KeyCode::Char('j') => app.nav_down(),
@@ -114,63 +119,61 @@ fn handle_normal_mode(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     }
 }
 
-fn handle_input_mode(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+fn handle_filter_mode(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     match code {
-        KeyCode::Enter => match handle_input_submission(app) {
-            Ok(success_message) => {
-                app.state = AppState::Normal;
-                app.refresh_all();
-                if let Some(message) = success_message {
-                    if !app.status.is_error() {
-                        app.set_success(message);
-                    }
-                } else if !app.status.is_error() {
-                    app.set_info("Nothing to submit.");
-                }
-            }
-            Err(err) => {
-                app.state = AppState::Normal;
-                app.set_error(format_user_error("Could not complete that action", err));
-            }
-        },
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => app.should_quit = true,
+        KeyCode::Char('?') => app.help.visible = true,
+        KeyCode::Enter => app.close_filter(),
         KeyCode::Esc => {
-            app.state = AppState::Normal;
-            app.input_buffer.clear();
-            app.set_info("Input cancelled.");
+            app.clear_filter();
+            app.set_info_banner("Filter cleared", "Showing every matching item again.");
         }
-        KeyCode::Backspace => {
-            app.input_buffer.pop();
-        }
-        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-            app.input_buffer.clear();
-        }
+        KeyCode::Backspace => app.pop_filter_char(),
+        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => app.clear_filter(),
         KeyCode::Char(character) if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
-            app.input_buffer.push(character);
+            app.push_filter_char(character);
         }
         _ => {}
     }
 }
 
-fn handle_confirm_mode(app: &mut App, code: KeyCode) {
+fn handle_input_mode(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     match code {
-        KeyCode::Char('y') | KeyCode::Enter => match handle_confirmation(app) {
-            Ok(success_message) => {
-                app.state = AppState::Normal;
-                app.refresh_all();
-                if let Some(message) = success_message {
-                    if !app.status.is_error() {
-                        app.set_success(message);
-                    }
-                }
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => app.should_quit = true,
+        KeyCode::Enter => handle_input_submission(app),
+        KeyCode::Esc => {
+            app.close_modal();
+            app.set_info_banner("Cancelled", "No changes were made.");
+        }
+        KeyCode::Backspace => {
+            if let Some(modal) = app.input_modal_mut() {
+                modal.value.pop();
+                modal.error = None;
             }
-            Err(err) => {
-                app.state = AppState::Normal;
-                app.set_error(format_user_error("Could not complete that action", err));
+        }
+        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(modal) = app.input_modal_mut() {
+                modal.value.clear();
+                modal.error = None;
             }
-        },
+        }
+        KeyCode::Char(character) if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
+            if let Some(modal) = app.input_modal_mut() {
+                modal.value.push(character);
+                modal.error = None;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_confirm_mode(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+    match code {
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => app.should_quit = true,
+        KeyCode::Char('y') | KeyCode::Enter => handle_confirmation(app),
         KeyCode::Char('n') | KeyCode::Esc => {
-            app.state = AppState::Normal;
-            app.set_info("Deletion cancelled.");
+            app.close_modal();
+            app.set_info_banner("Cancelled", "No changes were made.");
         }
         _ => {}
     }
@@ -178,16 +181,15 @@ fn handle_confirm_mode(app: &mut App, code: KeyCode) {
 
 fn handle_new_action(app: &mut App) {
     match app.focus {
-        FocusArea::Sessions => {
-            app.state = AppState::InputNewSession;
-            app.input_buffer.clear();
-        }
+        FocusArea::Sessions => app.open_input_modal(InputIntent::NewSession, ""),
         FocusArea::Windows => {
             if app.get_selected_session().is_some() {
-                app.state = AppState::InputNewWindow;
-                app.input_buffer.clear();
+                app.open_input_modal(InputIntent::NewWindow, "");
             } else {
-                app.set_info("Select a session before creating a window.");
+                app.set_info_banner(
+                    "Window unavailable",
+                    "Select a session before creating a window.",
+                );
             }
         }
         FocusArea::Panes => {
@@ -196,16 +198,19 @@ fn handle_new_action(app: &mut App) {
                 match tmux::create_pane(&pane_id) {
                     Ok(()) => {
                         app.refresh_all();
-                        if !app.status.is_error() {
-                            app.set_success("Split the selected pane.");
-                        }
+                        app.focus = FocusArea::Panes;
+                        app.set_success_banner(
+                            "Pane split",
+                            "The pane was split. Use Enter to attach or Tab to review the layout.",
+                        );
                     }
-                    Err(err) => {
-                        app.set_error(format_user_error("Could not split the selected pane", err));
-                    }
+                    Err(err) => app.set_error_banner(
+                        "Could not split pane",
+                        format_user_error("Split failed", err),
+                    ),
                 }
             } else {
-                app.set_info("Select a pane before splitting.");
+                app.set_info_banner("Pane unavailable", "Select a pane before splitting it.");
             }
         }
     }
@@ -218,24 +223,23 @@ fn handle_rename_action(app: &mut App) {
                 .get_selected_session()
                 .map(|session| session.name.clone());
             if let Some(name) = current_name {
-                app.state = AppState::InputRenameSession;
-                app.input_buffer = name;
+                app.open_input_modal(InputIntent::RenameSession, name);
             } else {
-                app.set_info("Select a session before renaming.");
+                app.set_info_banner("Rename unavailable", "Select a session before renaming it.");
             }
         }
         FocusArea::Windows => {
             let current_name = app.get_selected_window().map(|window| window.name.clone());
             if let Some(name) = current_name {
-                app.state = AppState::InputRenameWindow;
-                app.input_buffer = name;
+                app.open_input_modal(InputIntent::RenameWindow, name);
             } else {
-                app.set_info("Select a window before renaming.");
+                app.set_info_banner("Rename unavailable", "Select a window before renaming it.");
             }
         }
-        FocusArea::Panes => {
-            app.set_info("Pane renaming is handled inside tmux itself.");
-        }
+        FocusArea::Panes => app.set_info_banner(
+            "Rename unavailable",
+            "Pane names are managed inside tmux itself.",
+        ),
     }
 }
 
@@ -243,23 +247,23 @@ fn handle_delete_action(app: &mut App) {
     match app.focus {
         FocusArea::Sessions => {
             if app.get_selected_session().is_some() {
-                app.state = AppState::ConfirmDeleteSession;
+                app.open_confirm_modal(ConfirmIntent::Session);
             } else {
-                app.set_info("Select a session before deleting.");
+                app.set_info_banner("Delete unavailable", "Select a session before deleting it.");
             }
         }
         FocusArea::Windows => {
             if app.get_selected_window().is_some() {
-                app.state = AppState::ConfirmDeleteWindow;
+                app.open_confirm_modal(ConfirmIntent::Window);
             } else {
-                app.set_info("Select a window before deleting.");
+                app.set_info_banner("Delete unavailable", "Select a window before deleting it.");
             }
         }
         FocusArea::Panes => {
             if app.get_selected_pane().is_some() {
-                app.state = AppState::ConfirmDeletePane;
+                app.open_confirm_modal(ConfirmIntent::Pane);
             } else {
-                app.set_info("Select a pane before deleting.");
+                app.set_info_banner("Delete unavailable", "Select a pane before deleting it.");
             }
         }
     }
@@ -275,7 +279,7 @@ fn handle_attach_action(app: &mut App) {
                 app.target_attach = Some(target);
                 app.should_quit = true;
             } else {
-                app.set_info("Select a session before attaching.");
+                app.set_info_banner("Attach unavailable", "Select a session to attach.");
             }
         }
         FocusArea::Windows => {
@@ -287,14 +291,17 @@ fn handle_attach_action(app: &mut App) {
             match (session_name, window_id) {
                 (Some(session_name), Some(window_id)) => {
                     if let Err(err) = tmux::select_window(&window_id) {
-                        app.set_error(format_user_error("Could not select that window", err));
+                        app.set_error_banner(
+                            "Could not select window",
+                            format_user_error("Attach failed", err),
+                        );
                         return;
                     }
 
                     app.target_attach = Some(session_name);
                     app.should_quit = true;
                 }
-                _ => app.set_info("Select a window before attaching."),
+                _ => app.set_info_banner("Attach unavailable", "Select a window to attach."),
             }
         }
         FocusArea::Panes => {
@@ -307,112 +314,247 @@ fn handle_attach_action(app: &mut App) {
             match (session_name, window_id, pane_id) {
                 (Some(session_name), Some(window_id), Some(pane_id)) => {
                     if let Err(err) = tmux::select_window(&window_id) {
-                        app.set_error(format_user_error("Could not select that window", err));
+                        app.set_error_banner(
+                            "Could not select window",
+                            format_user_error("Attach failed", err),
+                        );
                         return;
                     }
 
                     if let Err(err) = tmux::select_pane(&pane_id) {
-                        app.set_error(format_user_error("Could not select that pane", err));
+                        app.set_error_banner(
+                            "Could not select pane",
+                            format_user_error("Attach failed", err),
+                        );
                         return;
                     }
 
                     app.target_attach = Some(session_name);
                     app.should_quit = true;
                 }
-                _ => app.set_info("Select a pane before attaching."),
+                _ => app.set_info_banner("Attach unavailable", "Select a pane to attach."),
             }
         }
     }
 }
 
-fn handle_input_submission(app: &mut App) -> Result<Option<String>> {
-    let value = app.input_buffer.trim().to_string();
-    app.input_buffer.clear();
+fn handle_input_submission(app: &mut App) {
+    let Some(modal) = app.input_modal().cloned() else {
+        return;
+    };
 
-    if value.is_empty() {
-        return Ok(None);
+    let value = modal.value.trim().to_string();
+    if let Some(error) = validate_name(&value) {
+        app.set_modal_error(error);
+        return;
     }
 
-    match app.state {
-        AppState::InputNewSession => {
-            tmux::create_session(&value)?;
-            Ok(Some(format!("Created session `{value}`.")))
-        }
-        AppState::InputRenameSession => {
+    match modal.intent {
+        InputIntent::NewSession => match tmux::create_session(&value) {
+            Ok(()) => {
+                app.close_modal();
+                app.focus = FocusArea::Sessions;
+                app.refresh_all();
+                app.select_session_by_name(&value);
+                app.set_success_banner(
+                    "Session created",
+                    format!("`{value}` is ready. Press Enter to attach or Tab to add a window."),
+                );
+            }
+            Err(err) => app.set_modal_error(format_user_error("Could not create session", err)),
+        },
+        InputIntent::RenameSession => {
             let old_name = app
                 .get_selected_session()
                 .map(|session| session.name.clone());
-            if let Some(old_name) = old_name {
-                if old_name == value {
-                    return Ok(Some("Session name was unchanged.".to_string()));
+            let Some(old_name) = old_name else {
+                app.close_modal();
+                app.set_warning_banner(
+                    "Selection changed",
+                    "Select a session and try that rename again.",
+                );
+                return;
+            };
+
+            if old_name == value {
+                app.close_modal();
+                app.set_info_banner(
+                    "Session unchanged",
+                    "The selected session already uses that name.",
+                );
+                return;
+            }
+
+            match tmux::rename_session(&old_name, &value) {
+                Ok(()) => {
+                    app.close_modal();
+                    app.focus = FocusArea::Sessions;
+                    app.refresh_all();
+                    app.select_session_by_name(&value);
+                    app.set_success_banner(
+                        "Session renamed",
+                        format!("The session is now named `{value}`."),
+                    );
                 }
-                tmux::rename_session(&old_name, &value)?;
-                Ok(Some(format!("Renamed session to `{value}`.")))
-            } else {
-                Ok(None)
+                Err(err) => app.set_modal_error(format_user_error("Could not rename session", err)),
             }
         }
-        AppState::InputNewWindow => {
+        InputIntent::NewWindow => {
             let session_id = app.get_selected_session().map(|session| session.id.clone());
-            if let Some(session_id) = session_id {
-                tmux::create_window(&session_id, &value)?;
-                Ok(Some(format!("Created window `{value}`.")))
-            } else {
-                Ok(None)
+            let Some(session_id) = session_id else {
+                app.close_modal();
+                app.set_warning_banner(
+                    "Selection changed",
+                    "Select a session and try that window creation again.",
+                );
+                return;
+            };
+
+            match tmux::create_window(&session_id, &value) {
+                Ok(()) => {
+                    app.close_modal();
+                    app.focus = FocusArea::Windows;
+                    app.refresh_all();
+                    app.select_window_by_name(&value);
+                    app.set_success_banner(
+                        "Window created",
+                        format!("`{value}` is ready. Press Tab to inspect its panes."),
+                    );
+                }
+                Err(err) => app.set_modal_error(format_user_error("Could not create window", err)),
             }
         }
-        AppState::InputRenameWindow => {
+        InputIntent::RenameWindow => {
             let window_id = app.get_selected_window().map(|window| window.id.clone());
             let current_name = app.get_selected_window().map(|window| window.name.clone());
-            match (window_id, current_name) {
-                (Some(window_id), Some(current_name)) => {
-                    if current_name == value {
-                        return Ok(Some("Window name was unchanged.".to_string()));
-                    }
-                    tmux::rename_window(&window_id, &value)?;
-                    Ok(Some(format!("Renamed window to `{value}`.")))
+            let (Some(window_id), Some(current_name)) = (window_id, current_name) else {
+                app.close_modal();
+                app.set_warning_banner(
+                    "Selection changed",
+                    "Select a window and try that rename again.",
+                );
+                return;
+            };
+
+            if current_name == value {
+                app.close_modal();
+                app.set_info_banner(
+                    "Window unchanged",
+                    "The selected window already uses that name.",
+                );
+                return;
+            }
+
+            match tmux::rename_window(&window_id, &value) {
+                Ok(()) => {
+                    app.close_modal();
+                    app.focus = FocusArea::Windows;
+                    app.refresh_all();
+                    app.select_window_by_name(&value);
+                    app.set_success_banner(
+                        "Window renamed",
+                        format!("The window is now named `{value}`."),
+                    );
                 }
-                _ => Ok(None),
+                Err(err) => app.set_modal_error(format_user_error("Could not rename window", err)),
             }
         }
-        _ => Ok(None),
     }
 }
 
-fn handle_confirmation(app: &mut App) -> Result<Option<String>> {
-    match app.state {
-        AppState::ConfirmDeleteSession => {
+fn handle_confirmation(app: &mut App) {
+    let Some(modal) = app.confirm_modal().cloned() else {
+        return;
+    };
+
+    match modal.intent {
+        ConfirmIntent::Session => {
             let session_name = app
                 .get_selected_session()
                 .map(|session| session.name.clone());
-            if let Some(session_name) = session_name {
-                tmux::kill_session(&session_name)?;
-                Ok(Some(format!("Deleted session `{session_name}`.")))
-            } else {
-                Ok(None)
+            let Some(session_name) = session_name else {
+                app.close_modal();
+                app.set_warning_banner(
+                    "Selection changed",
+                    "Select a session and try that delete again.",
+                );
+                return;
+            };
+
+            match tmux::kill_session(&session_name) {
+                Ok(()) => {
+                    app.close_modal();
+                    app.focus = FocusArea::Sessions;
+                    app.refresh_all();
+                    let follow_up = if app.sessions.is_empty() {
+                        "No sessions remain. Press n to create another."
+                    } else {
+                        "The next available session is selected."
+                    };
+                    app.set_success_banner("Session deleted", follow_up);
+                }
+                Err(err) => app.set_modal_error(format_user_error("Could not delete session", err)),
             }
         }
-        AppState::ConfirmDeleteWindow => {
+        ConfirmIntent::Window => {
             let window_id = app.get_selected_window().map(|window| window.id.clone());
             let window_name = app.get_selected_window().map(|window| window.name.clone());
-            match (window_id, window_name) {
-                (Some(window_id), Some(window_name)) => {
-                    tmux::kill_window(&window_id)?;
-                    Ok(Some(format!("Deleted window `{window_name}`.")))
+            let (Some(window_id), Some(window_name)) = (window_id, window_name) else {
+                app.close_modal();
+                app.set_warning_banner(
+                    "Selection changed",
+                    "Select a window and try that delete again.",
+                );
+                return;
+            };
+
+            match tmux::kill_window(&window_id) {
+                Ok(()) => {
+                    app.close_modal();
+                    app.focus = FocusArea::Windows;
+                    app.refresh_all();
+                    let follow_up = if app.windows.is_empty() {
+                        "That session has no windows left. Press n to create one."
+                    } else {
+                        "The next available window is selected."
+                    };
+                    app.set_success_banner(
+                        "Window deleted",
+                        format!("Deleted `{window_name}`. {follow_up}"),
+                    );
                 }
-                _ => Ok(None),
+                Err(err) => app.set_modal_error(format_user_error("Could not delete window", err)),
             }
         }
-        AppState::ConfirmDeletePane => {
+        ConfirmIntent::Pane => {
             let pane_id = app.get_selected_pane().map(|pane| pane.id.clone());
-            if let Some(pane_id) = pane_id {
-                tmux::kill_pane(&pane_id)?;
-                Ok(Some(format!("Deleted pane `{pane_id}`.")))
-            } else {
-                Ok(None)
+            let Some(pane_id) = pane_id else {
+                app.close_modal();
+                app.set_warning_banner(
+                    "Selection changed",
+                    "Select a pane and try that delete again.",
+                );
+                return;
+            };
+
+            match tmux::kill_pane(&pane_id) {
+                Ok(()) => {
+                    app.close_modal();
+                    app.focus = FocusArea::Panes;
+                    app.refresh_all();
+                    let follow_up = if app.panes.is_empty() {
+                        "That window has no panes left."
+                    } else {
+                        "The next available pane is selected."
+                    };
+                    app.set_success_banner(
+                        "Pane deleted",
+                        format!("Deleted `{pane_id}`. {follow_up}"),
+                    );
+                }
+                Err(err) => app.set_modal_error(format_user_error("Could not delete pane", err)),
             }
         }
-        _ => Ok(None),
     }
 }
 
@@ -455,6 +597,16 @@ fn handle_attach(app: &App) -> Result<()> {
     }
 }
 
+fn validate_name(value: &str) -> Option<&'static str> {
+    if value.trim().is_empty() {
+        Some("Enter a name to continue.")
+    } else if value.contains('\n') || value.contains('\r') {
+        Some("Names cannot contain line breaks.")
+    } else {
+        None
+    }
+}
+
 fn format_user_error(action: &str, err: anyhow::Error) -> String {
-    format!("{action}: {}", err)
+    format!("{action}: {err}")
 }
