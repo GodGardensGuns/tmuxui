@@ -9,6 +9,21 @@ const WINDOW_FORMAT: &str =
     "#{window_id}\u{1f}#{window_name}\u{1f}#{window_active}\u{1f}#{window_layout}";
 const PANE_FORMAT: &str = "#{pane_id}\u{1f}#{pane_width}\u{1f}#{pane_height}\u{1f}#{pane_current_path}\u{1f}#{pane_current_command}\u{1f}#{pane_active}";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TmuxConnectionState {
+    Connected,
+    NoServer,
+    Missing,
+    CommandFailed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionsSnapshot {
+    pub sessions: Vec<Session>,
+    pub connection: TmuxConnectionState,
+    pub detail: Option<String>,
+}
+
 pub fn run_tmux(args: &[&str]) -> Result<String> {
     let output = Command::new("tmux")
         .args(args)
@@ -35,11 +50,42 @@ fn run_tmux_unit(args: &[&str]) -> Result<()> {
     run_tmux(args).map(|_| ())
 }
 
-pub fn get_sessions() -> Result<Vec<Session>> {
+pub fn get_sessions_snapshot() -> SessionsSnapshot {
     match run_tmux(&["list-sessions", "-F", SESSION_FORMAT]) {
-        Ok(raw) => parse_sessions(&raw),
-        Err(err) if is_no_server_error(&err.to_string()) => Ok(Vec::new()),
-        Err(err) => Err(err.context("could not list tmux sessions")),
+        Ok(raw) => match parse_sessions(&raw) {
+            Ok(sessions) => SessionsSnapshot {
+                sessions,
+                connection: TmuxConnectionState::Connected,
+                detail: None,
+            },
+            Err(err) => SessionsSnapshot {
+                sessions: Vec::new(),
+                connection: TmuxConnectionState::CommandFailed,
+                detail: Some(err.to_string()),
+            },
+        },
+        Err(err) => {
+            let message = err.to_string();
+            if is_no_server_error(&message) {
+                SessionsSnapshot {
+                    sessions: Vec::new(),
+                    connection: TmuxConnectionState::NoServer,
+                    detail: None,
+                }
+            } else if is_tmux_missing_error(&message) {
+                SessionsSnapshot {
+                    sessions: Vec::new(),
+                    connection: TmuxConnectionState::Missing,
+                    detail: Some(message),
+                }
+            } else {
+                SessionsSnapshot {
+                    sessions: Vec::new(),
+                    connection: TmuxConnectionState::CommandFailed,
+                    detail: Some(message),
+                }
+            }
+        }
     }
 }
 
@@ -203,6 +249,12 @@ fn is_no_server_error(message: &str) -> bool {
             && normalized.contains("no such file or directory"))
 }
 
+fn is_tmux_missing_error(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("failed to start tmux")
+        && (normalized.contains("os error 2") || normalized.contains("no such file or directory"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +321,15 @@ mod tests {
             "error connecting to /tmp/tmux-501/default (No such file or directory)"
         ));
         assert!(!is_no_server_error("permission denied"));
+    }
+
+    #[test]
+    fn detects_missing_tmux_binary() {
+        assert!(is_tmux_missing_error(
+            "failed to start tmux with args: list-sessions: No such file or directory (os error 2)"
+        ));
+        assert!(!is_tmux_missing_error(
+            "error connecting to /tmp/tmux-501/default (No such file or directory)"
+        ));
     }
 }
