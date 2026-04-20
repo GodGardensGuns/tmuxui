@@ -371,12 +371,14 @@ impl App {
     }
 
     pub fn open_filter(&mut self) {
-        if self.filter.target != self.focus {
-            self.filter.query.clear();
-        }
-        self.filter.target = self.focus;
-        self.filter.active = true;
-        self.reconcile_after_filter_change();
+        let focus = self.focus;
+        self.mutate_filter_preserving_selection(|filter| {
+            if filter.target != focus {
+                filter.query.clear();
+            }
+            filter.target = focus;
+            filter.active = true;
+        });
     }
 
     pub fn close_filter(&mut self) {
@@ -384,9 +386,10 @@ impl App {
     }
 
     pub fn clear_filter(&mut self) {
-        self.filter.query.clear();
-        self.filter.active = false;
-        self.reconcile_after_filter_change();
+        self.mutate_filter_preserving_selection(|filter| {
+            filter.query.clear();
+            filter.active = false;
+        });
     }
 
     pub fn clear_filter_for(&mut self, focus: FocusArea) {
@@ -396,13 +399,15 @@ impl App {
     }
 
     pub fn push_filter_char(&mut self, character: char) {
-        self.filter.query.push(character);
-        self.reconcile_after_filter_change();
+        self.mutate_filter_preserving_selection(|filter| {
+            filter.query.push(character);
+        });
     }
 
     pub fn pop_filter_char(&mut self) {
-        self.filter.query.pop();
-        self.reconcile_after_filter_change();
+        self.mutate_filter_preserving_selection(|filter| {
+            filter.query.pop();
+        });
     }
 
     pub fn open_input_modal(&mut self, intent: InputIntent, value: impl Into<String>) {
@@ -697,12 +702,43 @@ impl App {
     }
 
     fn reconcile_after_filter_change(&mut self) {
-        let selected_session_id = self
-            .get_selected_session()
-            .map(|session| session.id.clone());
-        let selected_window_id = self.get_selected_window().map(|window| window.id.clone());
-        let selected_pane_id = self.get_selected_pane().map(|pane| pane.id.clone());
+        let (selected_session_id, selected_window_id, selected_pane_id) =
+            self.selected_ids_for_reconciliation();
+        self.reconcile_after_filter_change_with_selection(
+            selected_session_id,
+            selected_window_id,
+            selected_pane_id,
+        );
+    }
 
+    fn mutate_filter_preserving_selection<F>(&mut self, update: F)
+    where
+        F: FnOnce(&mut FilterState),
+    {
+        let (selected_session_id, selected_window_id, selected_pane_id) =
+            self.selected_ids_for_reconciliation();
+        update(&mut self.filter);
+        self.reconcile_after_filter_change_with_selection(
+            selected_session_id,
+            selected_window_id,
+            selected_pane_id,
+        );
+    }
+
+    fn selected_ids_for_reconciliation(&self) -> (Option<String>, Option<String>, Option<String>) {
+        (
+            self.get_selected_session().map(|session| session.id.clone()),
+            self.get_selected_window().map(|window| window.id.clone()),
+            self.get_selected_pane().map(|pane| pane.id.clone()),
+        )
+    }
+
+    fn reconcile_after_filter_change_with_selection(
+        &mut self,
+        selected_session_id: Option<String>,
+        selected_window_id: Option<String>,
+        selected_pane_id: Option<String>,
+    ) {
         match self.filter.target {
             FocusArea::Sessions => {
                 self.sync_session_selection(selected_session_id.as_deref());
@@ -1061,6 +1097,51 @@ mod tests {
 
         assert_eq!(app.visible_session_indices(), vec![1]);
         assert_eq!(app.selected_session_name(), Some("ops"));
+    }
+
+    #[test]
+    fn clearing_session_filter_preserves_selected_session() {
+        let mut app = sample_app();
+
+        app.filter.target = FocusArea::Sessions;
+        app.filter.query = "ops".to_string();
+        app.reconcile_after_filter_change();
+
+        app.clear_filter();
+
+        assert!(app.filter.query.is_empty());
+        assert!(!app.filter.active);
+        assert_eq!(app.selected_session_name(), Some("ops"));
+    }
+
+    #[test]
+    fn clearing_window_filter_preserves_selected_window() {
+        let mut app = sample_app();
+
+        app.filter.target = FocusArea::Windows;
+        app.filter.query = "logs".to_string();
+        app.reconcile_after_filter_change();
+
+        app.clear_filter();
+
+        assert!(app.filter.query.is_empty());
+        assert!(!app.filter.active);
+        assert_eq!(app.selected_window_name(), Some("logs"));
+    }
+
+    #[test]
+    fn clearing_pane_filter_preserves_selected_pane() {
+        let mut app = sample_app();
+
+        app.filter.target = FocusArea::Panes;
+        app.filter.query = "cargo".to_string();
+        app.reconcile_after_filter_change();
+
+        app.clear_filter();
+
+        assert!(app.filter.query.is_empty());
+        assert!(!app.filter.active);
+        assert_eq!(app.selected_pane_id(), Some("%11"));
     }
 
     #[test]
